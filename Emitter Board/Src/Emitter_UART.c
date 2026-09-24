@@ -1,0 +1,499 @@
+// UART.c
+// emitter board and detector board RX / TX
+// uart communication to PC
+//
+#include <string.h>
+#include <stdint.h>
+#include "LEDs.h"
+#include "CRC16.h"
+#include "Flash.h"
+#include "CRC32.h"
+#include "UART.h"
+
+//------------------------------------------------------------------------------
+extern UART_HandleTypeDef huart1;       // uart 1 handle
+
+uart_t Detector_Uart1;                  // uart 1 is emitter <--> detector
+uart_t PC_Uart2;                        // uart 2 is emitter <--> PC
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// TX message senders
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// this is used to send battery status to the detector board
+BatteryStatusMsg_t BatteryStatusMsg = {SYNC_FLAG, e_Battery_Status};
+void Send_Battery_Status(uint16_t status_mAH) {
+  BatteryStatusMsg.Status_mAH = status_mAH;
+
+  BatteryStatusMsg.Header.HeaderCRC = ~ComputeCRC16_LSBit(&BatteryStatusMsg, sizeof(MsgHeader_t)      - 2, CRC16_INIT);  // compute header CRC
+  BatteryStatusMsg.MsgCRC           = ~ComputeCRC16_LSBit(&BatteryStatusMsg, sizeof(BatteryStatusMsg) - 2, CRC16_INIT);  // compute packet CRC
+  Uart_TX_put_buf(&Detector_Uart1, (uint8_t *) &BatteryStatusMsg, sizeof(BatteryStatusMsg));
+}
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// RX message handlers
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+LightShowRequestMsg_t LightShowRequestMsg;
+void Process_LightShowRequestMsg(void *RX_msg) {
+  LightShowRequestMsg_t *pLightShowRequestMsg = (LightShowRequestMsg_t *) RX_msg;
+
+  LightShowRequestMsg.LEDs2                 = pLightShowRequestMsg->LEDs2;
+  LightShowRequestMsg.RGB2                  = pLightShowRequestMsg->RGB2;
+  LightShowRequestMsg.ball_crossing_time_ms = pLightShowRequestMsg->ball_crossing_time_ms;
+
+  LightShow_Selector = pLightShowRequestMsg->Selector;
+  LightShow_Init     = true;
+}
+
+//------------------------------------------------------------------------------
+// loopback test
+uint32_t Loopback_msg_count = 0;        // count number of RX messages from detector
+void Process_EmitterDetectorTestMsg(void *RX_msg) {
+  Loopback_msg_count++;
+
+  Uart_TX_put_buf(&Detector_Uart1, RX_msg, sizeof(EmitterDetectorTestMsg_t));
+}
+
+//------------------------------------------------------------------------------
+// set emitter PWMs
+// slot configuration request from detector
+Emitter_slot_rec_t Emitter_slot_rec_request[NUM_SLOTS] = {
+  { 0, 0},              // slot  0, emitter  0, PWM pct 0
+  {17, 0},              // slot  1, emitter 17, PWM pct 0
+  { 2, 0},              // slot  2, emitter  2, PWM pct 0
+  {19, 0},              // slot  3, emitter 19, PWM pct 0
+  { 4, 0},              // slot  4, emitter  4, PWM pct 0
+  {21, 0},              // slot  5, emitter 21, PWM pct 0
+  { 6, 0},              // slot  6, emitter  6, PWM pct 0
+  {23, 0},              // slot  7, emitter 23, PWM pct 0
+  { 8, 0},              // slot  8, emitter  8, PWM pct 0
+  {25, 0},              // slot  9, emitter 25, PWM pct 0
+  {10, 0},              // slot 10, emitter 10, PWM pct 0
+  {27, 0},              // slot 11, emitter 27, PWM pct 0
+  {12, 0},              // slot 12, emitter 12, PWM pct 0
+  {29, 0},              // slot 13, emitter 29, PWM pct 0
+  {14, 0},              // slot 14, emitter 14, PWM pct 0
+  {31, 0},              // slot 15, emitter 31, PWM pct 0
+  {16, 0},              // slot 16, emitter 16, PWM pct 0
+  { 1, 0},              // slot 17, emitter  1, PWM pct 0
+  {18, 0},              // slot 18, emitter 18, PWM pct 0
+  { 3, 0},              // slot 19, emitter  3, PWM pct 0
+  {20, 0},              // slot 20, emitter 20, PWM pct 0
+  { 5, 0},              // slot 21, emitter  5, PWM pct 0
+  {22, 0},              // slot 22, emitter 22, PWM pct 0
+  { 7, 0},              // slot 23, emitter  7, PWM pct 0
+  {24, 0},              // slot 24, emitter 24, PWM pct 0
+  { 9, 0},              // slot 25, emitter  9, PWM pct 0
+  {26, 0},              // slot 26, emitter 26, PWM pct 0
+  {11, 0},              // slot 27, emitter 11, PWM pct 0
+  {28, 0},              // slot 28, emitter 28, PWM pct 0
+  {13, 0},              // slot 29, emitter 13, PWM pct 0
+  {30, 0},              // slot 30, emitter 30, PWM pct 0
+  {15, 0},              // slot 31, emitter 15, PWM pct 0
+};
+
+void Process_EmitterSetPWMsMsg(void *RX_msg) {
+  EmitterSetPWMsMsg_t *pEmitterSetPWMs_Msg = (EmitterSetPWMsMsg_t *) RX_msg;
+
+  POST_state = pEmitterSetPWMs_Msg->POST_state;
+  // emitter controls LEDs independently until emitter PWM calibration is complete
+  if (POST_state) {
+    // emitter PWM calibration is complete
+    // detector side now controls emitter LEDs
+    LEDs_red   = pEmitterSetPWMs_Msg->Emitter_LEDs_red;
+    LEDs_green = pEmitterSetPWMs_Msg->Emitter_LEDs_green;
+    LEDs_blue  = pEmitterSetPWMs_Msg->Emitter_LEDs_blue;
+    LightShow_POST_update_request++;
+    }
+
+  memcpy(Emitter_slot_rec_request, pEmitterSetPWMs_Msg->Emitter_slot_rec, sizeof(Emitter_slot_rec_request));
+}
+
+//------------------------------------------------------------------------------
+uint16_t EmitterSetLEDs_Msg_fill_count  = 0;
+uint16_t EmitterSetLEDs_Msg_empty_count = 0;
+EmitterSetLEDsMsg_t EmitterSetLEDs_Msg;
+void Process_EmitterSetLEDsMsg(void *RX_msg) {
+  EmitterSetLEDsMsg_t *pEmitterSetLEDs_Msg = (EmitterSetLEDsMsg_t *) RX_msg;
+
+  // light show is controlled by mobile app
+  LightShow_Selector = -1;
+
+  EmitterSetLEDs_Msg.LEDs2 = pEmitterSetLEDs_Msg->LEDs2;
+  EmitterSetLEDs_Msg.RGB2  = pEmitterSetLEDs_Msg->RGB2;
+  EmitterSetLEDs_Msg.LEDs1 = pEmitterSetLEDs_Msg->LEDs1;
+  EmitterSetLEDs_Msg.RGB1  = pEmitterSetLEDs_Msg->RGB1;
+
+  EmitterSetLEDs_Msg_fill_count++;
+}
+
+//------------------------------------------------------------------------------
+// the bootloader will support up to 112 k bytes
+// the emitter build does not have enough ram to capture an entire 112 k byte image
+// so we use 72 k bytes instead
+#define EMITTER_IMAGE_SIZE (uint32_t) (72 * 1024)                       // 112k bytes max in bootloader
+#pragma data_alignment=16
+uint32_t Emitter_code_image[EMITTER_IMAGE_SIZE/4];
+void Process_EmitterCodeImageMsg(void *RX_msg) {
+  EmitterCodeImageMsg_t *pMsg = (EmitterCodeImageMsg_t *) RX_msg;       // pointer to message packet
+  uint16_t  index             = pMsg->packet_number;                    // packet number
+  uint32_t *data              = (uint32_t *) &pMsg->data;               // pointer to packet data
+  uint32_t *code              = &Emitter_code_image[index * 4];         // pointer to code image
+
+  // init the code image when first packet of a fresh download
+  if (index == 0) {
+    uint16_t i;
+    for (i = 0; i < EMITTER_IMAGE_SIZE/4; i++) Emitter_code_image[i] = ~0ul;
+    }
+
+  // index * 16 is byte offset into code array
+  // check (index * 16) < sizeof(Emitter_code_image)
+  if (index < (EMITTER_IMAGE_SIZE/16)) {
+    // copy 16 bytes into code image
+    code[0] = data[0];
+    code[1] = data[1];
+    code[2] = data[2];
+    code[3] = data[3];
+    }
+
+  // the code image is complete when the image CRC has been sent
+  // check code image ram buffer after last packet
+  if (Emitter_code_image[EMITTER_IMAGE_SIZE/4-1] != ~0ul) {
+    Compute_code_image_CRCs();
+    }
+}
+
+//------------------------------------------------------------------------------
+// reset all peripherals to power up state
+// to disable interrupt sources before reconfiguring peripherals
+void ResetPeripherals(void) {
+  __HAL_RCC_AHB1_FORCE_RESET(); __DSB(); __ISB(); __HAL_RCC_AHB1_RELEASE_RESET(); __DSB(); __ISB();
+  __HAL_RCC_AHB2_FORCE_RESET(); __DSB(); __ISB(); __HAL_RCC_AHB2_RELEASE_RESET(); __DSB(); __ISB();
+  __HAL_RCC_AHB3_FORCE_RESET(); __DSB(); __ISB(); __HAL_RCC_AHB3_RELEASE_RESET(); __DSB(); __ISB();
+  __HAL_RCC_APB1_FORCE_RESET(); __DSB(); __ISB(); __HAL_RCC_APB1_RELEASE_RESET(); __DSB(); __ISB();
+  __HAL_RCC_APB2_FORCE_RESET(); __DSB(); __ISB(); __HAL_RCC_APB2_RELEASE_RESET(); __DSB(); __ISB(); 
+}
+
+//------------------------------------------------------------------------------
+void BootJump(uint32_t Vector_table_addr) {
+  uint32_t *Vector_table = (uint32_t *) Vector_table_addr;
+
+  // disable all interrupts
+  NVIC->ICER[0] = ~0;
+  NVIC->ICER[1] = ~0;
+  NVIC->ICER[2] = ~0;
+  NVIC->ICER[3] = ~0;
+  NVIC->ICER[4] = ~0;
+  NVIC->ICER[5] = ~0;
+  NVIC->ICER[6] = ~0;
+  NVIC->ICER[7] = ~0;
+
+  // clear all pending interrupt requests
+  NVIC->ICPR[0] = ~0;
+  NVIC->ICPR[1] = ~0;
+  NVIC->ICPR[2] = ~0;
+  NVIC->ICPR[3] = ~0;
+  NVIC->ICPR[4] = ~0;
+  NVIC->ICPR[5] = ~0;
+  NVIC->ICPR[6] = ~0;
+  NVIC->ICPR[7] = ~0;
+
+  // disable interrupt sources before reconfiguring peripherals
+  ResetPeripherals();
+
+  // disable SysTick and clear exception pending bit
+  SysTick->CTRL = 0;
+  SCB->ICSR     = (SCB_ICSR_PENDSTCLR_Msk |
+                   SCB_ICSR_PENDSVCLR_Msk);
+
+  // disable fault handlers
+  SCB->SHCSR &= ~(SCB_SHCSR_USGFAULTENA_Msk |
+                  SCB_SHCSR_BUSFAULTENA_Msk |
+                  SCB_SHCSR_MEMFAULTENA_Msk);
+
+  // assure MSP is the active stack
+  __set_CONTROL(__get_CONTROL() & ~CONTROL_SPSEL_Msk);
+
+  // load vector table address
+  SCB->VTOR = (uint32_t) Vector_table;
+
+  // set MSP from vector table
+  __set_MSP(Vector_table[0]);
+
+  // jump to program entry point by using function call indirect through Vector_table[1]
+  ((void(*)(void)) Vector_table[1])();
+}
+
+//------------------------------------------------------------------------------
+// emitter restart now message after OTA update
+void Process_EmitterRestartNowMsg(void *RX_msg) {
+  // erase sector 7
+  Erase_flash_sector(FLASH_SECTOR_7);           // 128 kb
+
+  // copy code image to secondary code image
+  Program_flash_sector_word(ADDR_FLASH_SECTOR_7, (uint32_t) &Emitter_code_image, EMITTER_IMAGE_SIZE/4);
+
+  // jump to emitter bootloader now
+  // which resets emitter, causing detector to lose power
+  // after power is restored to detector, the detector bootloader will run
+  BootJump(ADDR_FLASH_SECTOR_0);                // jump to emitter bootloader entry point
+}
+
+//------------------------------------------------------------------------------
+// this message is used by the PC to emulate a power cycle
+void Process_Power_Cycle_Msg(void *RX_msg) {
+  // jump to emitter bootloader now
+  // which resets emitter, causing detector to lose power
+  // after power is restored to detector, the detector bootloader will run
+  BootJump(ADDR_FLASH_SECTOR_0);                // jump to emitter bootloader entry point
+}
+
+//------------------------------------------------------------------------------
+// the bootloader       is located in FLASH_SECTOR_0
+// the primary   image  is located in FLASH_SECTOR_1
+// the secondary image  is located in FLASH_SECTOR_7
+CodeImageCRCMsg_t CodeImageCRCMsg = {
+  .Header = {SYNC_FLAG, e_Code_Image_CRCs}
+};
+
+//------------------------------------------------------------------------------
+void code_image_CRC32(uint32_t *crc, uint32_t start_addr) {
+  uint32_t end_addr   = start_addr + EMITTER_IMAGE_SIZE - 5;    // backup over CRC to last byte of code image
+  uint32_t crc32_addr = start_addr + EMITTER_IMAGE_SIZE - 4;    // backup to first byte of CRC
+  *crc                = * (uint32_t *) crc32_addr;              // assume CRC is OK
+  if (!CheckCRC32_MSBit(start_addr, end_addr, *crc)) {          // check the CRC on this region
+    *crc = ~0ul;                                                // CRC failed, return 0xffffffff
+    }
+}
+
+//------------------------------------------------------------------------------
+// check the image CRCs
+void Compute_code_image_CRCs(void) {
+  code_image_CRC32((uint32_t *) &CodeImageCRCMsg.ram_image_crc32,       (uint32_t) Emitter_code_image);
+  code_image_CRC32((uint32_t *) &CodeImageCRCMsg.primary_image_crc32,   (uint32_t) ADDR_FLASH_SECTOR_1);
+  code_image_CRC32((uint32_t *) &CodeImageCRCMsg.secondary_image_crc32, (uint32_t) ADDR_FLASH_SECTOR_7);
+}
+
+//------------------------------------------------------------------------------
+// detector sends request for CRCs, emitter responds after receiving request from detector
+uint16_t  code_image_crc_msg_count     = 0;     // count number of RX messages from detector
+uint16_t  code_image_packet_send_count = 0;
+uint32_t *pCode_image;                          // pointer to code image
+
+EmitterCodeImageMsg_t EmitterCodeImageMsg = {
+  .Header = {SYNC_FLAG, e_Emitter_Code_Image}
+};
+
+void Process_emitter_code_image_cmd_Msg(void *RX_msg) {
+  EmitterCodeImageCmdMsg_t *pMsg = (EmitterCodeImageCmdMsg_t *) RX_msg;
+
+  switch (pMsg->cmd) {
+    case e_ECIcmd_request_code_image_CRCs     : // 0=request code image CRCs
+                                                code_image_crc_msg_count++;
+                                                CodeImageCRCMsg.Header.HeaderCRC = ~ComputeCRC16_LSBit(&CodeImageCRCMsg, sizeof(MsgHeader_t)     - 2, CRC16_INIT);  // compute header CRC
+                                                CodeImageCRCMsg.MsgCRC           = ~ComputeCRC16_LSBit(&CodeImageCRCMsg, sizeof(CodeImageCRCMsg) - 2, CRC16_INIT);  // compute packet CRC
+                                                Uart_TX_put_buf(&Detector_Uart1, (uint8_t *) &CodeImageCRCMsg, sizeof(CodeImageCRCMsg));
+    default                                   : return;
+    case e_ECIcmd_request_code_array_image    : pCode_image = (uint32_t *) Emitter_code_image;  break;  // 1=request code array image
+    case e_ECIcmd_request_primary_code_image  : pCode_image = (uint32_t *) ADDR_FLASH_SECTOR_1; break;  // 2=request primary image
+    case e_ECIcmd_request_secondary_code_image: pCode_image = (uint32_t *) ADDR_FLASH_SECTOR_7; break;  // 3=request secondary image
+    }
+
+  // common for all code image requests
+  EmitterCodeImageMsg.packet_number = 0;
+  code_image_packet_send_count      = EMITTER_IMAGE_SIZE/16;
+}
+
+//------------------------------------------------------------------------------
+void Process_EraseSecondaryFlashMsg(void *RX_msg) {
+  Erase_flash_sector(FLASH_SECTOR_7);           // erase emitter secondary 128 kb
+
+  Compute_code_image_CRCs();
+
+  // send code image CRCs to detector
+  CodeImageCRCMsg.Header.HeaderCRC = ~ComputeCRC16_LSBit(&CodeImageCRCMsg, sizeof(MsgHeader_t)     - 2, CRC16_INIT);  // compute header CRC
+  CodeImageCRCMsg.MsgCRC           = ~ComputeCRC16_LSBit(&CodeImageCRCMsg, sizeof(CodeImageCRCMsg) - 2, CRC16_INIT);  // compute packet CRC
+  Uart_TX_put_buf(&Detector_Uart1, (uint8_t *) &CodeImageCRCMsg, sizeof(CodeImageCRCMsg));
+}
+
+//------------------------------------------------------------------------------
+// send the requested code image to the detector
+// this task is called from the main loop
+void Emitter_code_image_task(void) {
+  if (code_image_packet_send_count && (Uart_TX_FIFO_avail(&Detector_Uart1) >= sizeof(EmitterCodeImageMsg))) {
+    code_image_packet_send_count--;
+
+    // skip this packet if all 16 bytes are 0xff
+    if ((pCode_image[0] != ~0ul) ||
+        (pCode_image[1] != ~0ul) ||
+        (pCode_image[2] != ~0ul) ||
+        (pCode_image[3] != ~0ul)) {
+
+      // copy 16 bytes into code image
+      EmitterCodeImageMsg.data[0] = pCode_image[0];
+      EmitterCodeImageMsg.data[1] = pCode_image[1];
+      EmitterCodeImageMsg.data[2] = pCode_image[2];
+      EmitterCodeImageMsg.data[3] = pCode_image[3];
+
+      EmitterCodeImageMsg.Header.HeaderCRC = ~ComputeCRC16_LSBit(&EmitterCodeImageMsg, sizeof(MsgHeader_t)         - 2, CRC16_INIT);  // compute header CRC
+      EmitterCodeImageMsg.MsgCRC           = ~ComputeCRC16_LSBit(&EmitterCodeImageMsg, sizeof(EmitterCodeImageMsg) - 2, CRC16_INIT);  // compute packet CRC
+      Uart_TX_put_buf(&Detector_Uart1, (uint8_t *) &EmitterCodeImageMsg, sizeof(EmitterCodeImageMsg));
+      }
+
+    EmitterCodeImageMsg.packet_number++;
+    pCode_image += 4;
+    }
+}
+
+//------------------------------------------------------------------------------
+// process incoming messages
+void Process_msg(uart_t *uart, void *RX_msg) {
+  MsgHeader_t *pMsgHeader = (MsgHeader_t *) RX_msg;
+
+  switch (pMsgHeader->Cmd) {
+    case e_Light_Show_Request    : Process_LightShowRequestMsg       (RX_msg); break;
+  //case e_Set_ADC_Sequence      :                                             break;
+  //case e_Set_Emitter_Voltage   : Process_SetEmitterVoltage         (RX_msg); break;
+  //case e_Emitter_Light_Dark_ADC:                                             break;
+  //case e_Emitter_Vector        :                                             break;
+  //case e_Ball_Shadow_Detected  :                                             break;
+  //case e_Battery_Status        :                                             break;
+    case e_Emitter_Detector_Test : Process_EmitterDetectorTestMsg    (RX_msg); break;
+    case e_Emitter_Set_PWMs      : Process_EmitterSetPWMsMsg         (RX_msg); break;
+    case e_Emitter_Set_LEDs      : Process_EmitterSetLEDsMsg         (RX_msg); break;
+    case e_Emitter_Code_Image    : Process_EmitterCodeImageMsg       (RX_msg); break;
+    case e_Emitter_Restart_Now   : Process_EmitterRestartNowMsg      (RX_msg); break;
+  //case e_Get_Serial_Number     : Process_Get_Serial_Number_Msg     (RX_msg); break;
+  //case e_Set_Serial_Number     : Process_Set_Serial_Number_Msg     (RX_msg); break;
+    case e_Power_Cycle           : Process_Power_Cycle_Msg           (RX_msg); break;
+    case e_Emitter_code_image_cmd: Process_emitter_code_image_cmd_Msg(RX_msg); break;
+  //case e_Code_Image_CRCs       : Process_CodeImageCRCMsg           (RX_msg); break;
+    case e_Erase_Secondary_Flash : Process_EraseSecondaryFlashMsg    (RX_msg); break;
+    }
+}
+
+//------------------------------------------------------------------------------
+// return total length of packet
+// return zero if command is not recognized
+uint16_t Uart_Get_RX_Msg_len(void *RX_msg) {
+  MsgHeader_t *pMsgHeader = (MsgHeader_t *) RX_msg;
+
+  switch (pMsgHeader->Cmd) {
+    case e_Light_Show_Request    : return sizeof(LightShowRequestMsg_t);
+  //case e_Set_ADC_Sequence      : return sizeof(SetADCSequenceMsg_t);
+  //case e_Set_Emitter_Voltage   : return sizeof(SetEmitterVoltageMsg_t);
+  //case e_Emitter_Light_Dark_ADC: return sizeof(EmitterLightDark_ADC_Msg_t);
+  //case e_Emitter_Vector        : return sizeof(EmitterVectorMsg_t);
+  //case e_Ball_Shadow_Detected  : return sizeof(BallShadowMsg_t);
+  //case e_Battery_Status        : return sizeof(BatteryStatusMsg_t);
+    case e_Emitter_Detector_Test : return sizeof(EmitterDetectorTestMsg_t);
+    case e_Emitter_Set_PWMs      : return sizeof(EmitterSetPWMsMsg_t);
+    case e_Emitter_Set_LEDs      : return sizeof(EmitterSetLEDsMsg_t);
+    case e_Emitter_Code_Image    : return sizeof(EmitterCodeImageMsg_t);
+    case e_Emitter_Restart_Now   : return sizeof(EmitterRestartNowMsg_t);
+  //case e_Get_Serial_Number     : return sizeof(GetSerialNumberMsg_t);
+  //case e_Set_Serial_Number     : return sizeof(SetSerialNumberMsg_t);
+    case e_Power_Cycle           : return sizeof(PowerCycleMsg_t);
+    case e_Emitter_code_image_cmd: return sizeof(EmitterCodeImageCmdMsg_t);
+  //case e_Code_Image_CRCs       : return sizeof(CodeImageCRCMsg_t);
+    case e_Erase_Secondary_Flash : return sizeof(EraseSecondaryFlashMsg_t);
+    }
+
+  return 0;
+}
+
+//------------------------------------------------------------------------------
+#define DETECTOR_TX_FIFO_SIZE (100)
+#define DETECTOR_RX_FIFO_SIZE (100)
+
+uint8_t DETECTOR_TX_FIFO[1*DETECTOR_TX_FIFO_SIZE];
+uint8_t DETECTOR_RX_FIFO[2*DETECTOR_RX_FIFO_SIZE];      // size must be doubled to accomodate double-store
+
+uint16_t erase_flash_sector_7 = 0;
+
+void Detector_Uart1_Init(void) {
+  Uart_Init(&Detector_Uart1,                            // struct
+            &huart1,                                    // handle
+            DETECTOR_TX_FIFO, DETECTOR_TX_FIFO_SIZE,
+            DETECTOR_RX_FIFO, DETECTOR_RX_FIFO_SIZE);
+
+  // for debug and testing only
+  // if (erase_flash_sector_7) Erase_flash_sector(FLASH_SECTOR_7);        // 128 kb
+}
+
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// battery monitor
+//------------------------------------------------------------------------------
+//
+// the battery monitor measures total current for the entire system
+// (both emitter and detector)
+// scaling is 6 amps -> 3 volts
+// and 3.3V -> 4095 ADC counts
+// for example, 2 amps * (1 v / 2 amps) * (4095 ADC / 3.3 v) = 1240.909 ADC counts
+//
+// the ADC is sampled at 1000 samples per second and accumulated
+// we need mAH:
+//
+// (ADC accumulation) * 1 ms * (3.3V/4095 ADC) * (2 Amp/1 V) * (1000 mA/A) * (1 sec/1000 ms) * (1 Hour/3600 sec) = y mAH
+// (ADC accumulation) * 3.3 / 4095 / 1800 = y mAH 
+// (ADC accumulation) / 2233636.364 = y mAH 
+
+#define ADC1_RESULTS_SIZE 3
+uint16_t ADC1_Results[ADC1_RESULTS_SIZE];       // [0] = detector PCB current
+                                                // [1] = battery current
+                                                // [2] = battery voltage
+uint16_t Battery_current_ADC1_Results_Cplt_Cnt_ISR  = 0;
+uint16_t Battery_current_ADC1_Results_Cplt_Cnt_Task = 0;
+uint64_t Battery_current_accumulation = 0;      // continuous 1000 Hz accumulation of battery current ADCs
+
+extern bool EmittersInitialized;
+extern ADC_HandleTypeDef hadc1;
+
+//------------------------------------------------------------------------------
+// called from SysTick_Handler
+// start ADC conversion
+void Battery_monitor_start_ADC(void) {
+  if (EmittersInitialized) {
+    HAL_ADC_Stop_DMA (&hadc1);
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t *) ADC1_Results, ADC1_RESULTS_SIZE);
+    }
+}
+
+//------------------------------------------------------------------------------
+// end of ADC conversion (DMA complete callback)
+// this overrides a weak callback in stm32f4xx_hal_adc.c
+// called from DMA2_Stream0_IRQHandler
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
+  if (hadc == &hadc1) Battery_current_ADC1_Results_Cplt_Cnt_ISR++;
+}
+
+//------------------------------------------------------------------------------
+// accumulate battery current
+// output a battery status message once every 5 seconds
+uint16_t battery_current_mAH = 0;                       // accumulated milli amp hours
+void Battery_monitor_task(void) {
+  static int16_t  state = -1;
+  static uint32_t timeout;
+
+  if ((int16_t) (Battery_current_ADC1_Results_Cplt_Cnt_ISR - Battery_current_ADC1_Results_Cplt_Cnt_Task) > 0) {
+    Battery_current_ADC1_Results_Cplt_Cnt_Task++;
+    Battery_current_accumulation += ADC1_Results[1];
+    }
+
+  switch (state) {
+    case -1: // init
+             timeout = HAL_GetTick() + 1000;
+             state = 0;
+    case  0: // output a battery status message once every 5 seconds
+             if ((int32_t) (timeout - HAL_GetTick()) > 0) break;
+             timeout +=  5000;
+             battery_current_mAH = Battery_current_accumulation / 2233636ul;
+             Send_Battery_Status(battery_current_mAH);
+    }
+}
