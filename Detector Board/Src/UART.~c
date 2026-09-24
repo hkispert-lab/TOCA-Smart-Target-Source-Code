@@ -1,0 +1,1405 @@
+// UART.c
+// emitter board and detector board RX / TX
+// uart communication to PC
+//
+
+#include <string.h>
+#include "main.h"
+#include "CRC16.h"
+#include "LEDs.h"
+#include "Flash.h"
+#include "UART.h"
+
+//------------------------------------------------------------------------------
+// UART setup:
+//
+// Mode: Async
+// Hardware Flow Control (RS232) Disable
+// Parameter settings:
+//      Baud Rate 115200 Bits/s
+//      word length 8 bits (including parity)
+//      parity none
+//      stop bits 1
+//      data direction receive and transmit
+//      over sampling 16 samples
+// User constants none
+// NVIC Interrupts USART5 global interrupt enabled
+//      do not call HAL handler (call Uart_ISR() instead)
+// DMA Settings none
+// GPIO Settings:
+//      PE7 UART5_RX  Alternate, pullup, very high
+//      PE8 UART5_TX  Alternate, pullup, very high
+
+//------------------------------------------------------------------------------
+void Uart_Init(uart_t             *uart,
+               UART_HandleTypeDef *huart,
+               uint8_t            *tx_fifo,
+               uint16_t            tx_fifo_size,
+               uint8_t            *rx_fifo,
+               uint16_t            rx_fifo_size) {
+  memset(uart, 0, sizeof(uart_t));
+  
+  uart->Uart_Instance                       = huart->Instance;  // base address of USART module
+
+  uart->TX_start_ptr                        = tx_fifo;
+  uart->TX_end_ptr                          = tx_fifo + tx_fifo_size;
+  uart->TX_fill_ptr                         = tx_fifo;
+  uart->TX_empty_ptr                        = tx_fifo;
+  uart->TX_FIFO_size                        = tx_fifo_size;
+//uart->TX_fill_count                       = 0;
+//uart->TX_empty_count                      = 0;
+//uart->TX_max_count                        = 0;
+//uart->TX_overflow                         = false;
+
+  uart->RX_start_ptr                        = rx_fifo;
+  uart->RX_end_ptr                          = rx_fifo + rx_fifo_size;
+  uart->RX_fill_ptr                         = rx_fifo;
+  uart->RX_empty_ptr                        = rx_fifo;
+  uart->RX_FIFO_size                        = rx_fifo_size;
+//uart->RX_fill_count                       = 0;
+//uart->RX_empty_count                      = 0;
+//uart->RX_max_count                        = 0;
+//uart->RX_overflow                         = false;
+//uart->RX_framing_error                    = 0;
+
+//uart->RX_parse_msg_state                  = 0;
+//uart->RX_parse_msg_len                    = 0;
+//uart->RX_parse_msg_OK_cnt                 = 0;
+//uart->RX_parse_msg_timeout                = 0;
+//uart->RX_parse_msg_timeout_cnt            = 0;
+//uart->RX_parse_msg_invalid_header_err_cnt = 0;
+//uart->RX_parse_msg_invalid_msg_err_cnt    = 0;
+
+  uart->Uart_Instance->CR1 |= USART_CR1_RXNEIE;                 // enable RX ints
+}
+
+//------------------------------------------------------------------------------
+void Uart_ISR(uart_t *uart) {
+  uint32_t sr = uart->Uart_Instance->SR;                        // get status register
+
+  // check for RX char ready interrupt
+  if (sr & USART_SR_RXNE) {
+    uint8_t dr               = uart->Uart_Instance->DR;       // get data register
+    int16_t RX_chars_in_FIFO = uart->RX_fill_count - uart->RX_empty_count;
+
+    // check for free space in the RX FIFO
+    if (++RX_chars_in_FIFO <= uart->RX_FIFO_size) {
+      // store RX byte into the FIFO (twice)
+      // helps with CRC checking and packet processing in the RX parser
+      uart->RX_fill_ptr[0]                  = dr;
+      uart->RX_fill_ptr[uart->RX_FIFO_size] = dr;
+
+      // advance the fill pointer and counter
+      if (++uart->RX_fill_ptr >= uart->RX_end_ptr) uart->RX_fill_ptr -= uart->RX_FIFO_size;
+      uart->RX_fill_count++;
+
+      // update max RX count
+      if (uart->RX_max_count < RX_chars_in_FIFO) uart->RX_max_count = RX_chars_in_FIFO;
+      }
+    else uart->RX_overflow = true;
+
+    // check for framing error (from break)
+    if (sr & USART_SR_FE) uart->RX_framing_error++;
+    }
+
+  // check for TX empty interrupt AND interrupt enabled
+  if ((sr & USART_SR_TXE) && (uart->Uart_Instance->CR1 & USART_CR1_TXEIE)) {
+    int16_t TX_chars_in_FIFO = uart->TX_fill_count - uart->TX_empty_count;
+
+    // check for chars in the TX FIFO to send
+    if (TX_chars_in_FIFO > 0) {
+      // send one TX byte from FIFO
+      uart->Uart_Instance->DR = *uart->TX_empty_ptr;
+
+      // advance empty counter
+      uart->TX_empty_count++;
+
+      // advance the empty pointer
+      if (++uart->TX_empty_ptr >= uart->TX_end_ptr) uart->TX_empty_ptr -= uart->TX_FIFO_size;
+      }
+    else uart->Uart_Instance->CR1 &= ~USART_CR1_TXEIE;        // no more data to send, disable TX ints
+    }
+}
+
+//------------------------------------------------------------------------------
+int16_t Uart_RX_FIFO_count(uart_t *uart) {return                      uart->RX_fill_count - uart->RX_empty_count;}
+int16_t Uart_RX_FIFO_avail(uart_t *uart) {return uart->RX_FIFO_size - uart->RX_fill_count + uart->RX_empty_count;}
+
+//------------------------------------------------------------------------------
+int16_t Uart_TX_FIFO_count(uart_t *uart) {return                      uart->TX_fill_count - uart->TX_empty_count;}
+int16_t Uart_TX_FIFO_avail(uart_t *uart) {return uart->TX_FIFO_size - uart->TX_fill_count + uart->TX_empty_count;}
+
+//------------------------------------------------------------------------------
+void Uart_TX_put_char(uart_t *uart, uint8_t data) {
+  int16_t TX_chars_in_FIFO = uart->TX_fill_count - uart->TX_empty_count;
+
+  // check for free space in the TX FIFO
+  if (++TX_chars_in_FIFO <= uart->TX_FIFO_size) {
+    // store TX byte into the FIFO
+    uart->TX_fill_ptr[0] = data;
+
+    // advance fill counter
+    uart->TX_fill_count++;
+
+    // enable TX interrupts if disabled
+    if ((uart->Uart_Instance->CR1 &  USART_CR1_TXEIE) == 0)
+         uart->Uart_Instance->CR1 |= USART_CR1_TXEIE;
+
+    // advance the fill pointer
+    if (++uart->TX_fill_ptr >= uart->TX_end_ptr) uart->TX_fill_ptr -= uart->TX_FIFO_size;
+
+    // update max TX count
+    if (uart->TX_max_count < TX_chars_in_FIFO) uart->TX_max_count = TX_chars_in_FIFO;
+    }
+  else uart->TX_overflow = true;
+}
+
+//------------------------------------------------------------------------------
+// output buffer of specified length
+void Uart_TX_put_buf(uart_t *uart, uint8_t *data, int16_t len) {
+  while (--len >= 0) {
+    Uart_TX_put_char(uart, *data++);
+    }
+}
+
+//------------------------------------------------------------------------------
+// output null-terminated string
+void Uart_TX_put_str(uart_t *uart, uint8_t *data) {
+  while (*data) {
+    Uart_TX_put_char(uart, *data++);
+    }
+}
+
+//------------------------------------------------------------------------------
+// send break
+void Uart_send_break(uart_t *uart) {
+  uart->Uart_Instance->CR1 |= USART_CR1_SBK;
+}
+
+//------------------------------------------------------------------------------
+uint8_t Uart_RX_get_char(uart_t *uart) {
+  int16_t RX_chars_in_FIFO = uart->RX_fill_count - uart->RX_empty_count;
+  uint8_t data = 0;
+
+  if (RX_chars_in_FIFO) {
+    data = uart->RX_empty_ptr[0];
+
+    // advance the empty pointer and counter
+    if (++uart->RX_empty_ptr >= uart->RX_end_ptr) uart->RX_empty_ptr -= uart->RX_FIFO_size;
+    uart->RX_empty_count++;
+    }
+
+  return data;
+}
+
+//------------------------------------------------------------------------------
+void Uart_RX_discard_chars(uart_t *uart, int16_t char_count) {
+  // advance the empty pointer and counter
+
+  uart->RX_empty_ptr += char_count;
+  if (uart->RX_empty_ptr >= uart->RX_end_ptr) uart->RX_empty_ptr -= uart->RX_FIFO_size;
+
+  uart->RX_empty_count += char_count;
+}
+
+//------------------------------------------------------------------------------
+// return the next FIFO byte without advancing the empty pointer
+uint8_t Uart_peek_RX_FIFO(uart_t *uart) {
+  return uart->RX_empty_ptr[0];
+}
+
+//------------------------------------------------------------------------------
+void Process_msg            (uart_t *uart, void *RX_msg);
+uint16_t Uart_Get_RX_Msg_len(void *RX_msg);
+
+//------------------------------------------------------------------------------
+// packet parser
+void RX_ParseMsgTask(uart_t *uart, uint32_t clock_ticks) {
+  // if we are actively parsing a message (sync byte found, looking for complete message)
+  // then check RX timeout
+  if (uart->RX_parse_msg_state) {
+    if ((int32_t) (uart->RX_parse_msg_timeout - clock_ticks) <= 0) {
+      // message parsing timed out
+      // reset state machine to restart scanner
+      uart->RX_parse_msg_timeout_cnt++;
+      uart->RX_parse_msg_state = 0;
+      }
+    }
+
+  // scan for valid message
+  switch (uart->RX_parse_msg_state) {
+    default:
+    case  0: // scan for sync byte
+             while ((Uart_RX_FIFO_count(uart) > 0) && (Uart_peek_RX_FIFO(uart) != SYNC_FLAG)) {
+               // not a sync byte, discard the data
+               Uart_RX_discard_chars(uart, 1);
+               }
+
+             // if there is at least one byte in the RX FIFO
+             // then we have found the sync byte
+             // else wait for sync byte
+             if (Uart_RX_FIFO_count(uart) <= 0) break;
+
+             // we found the sync byte
+             // setup timeout so we don't get stuck waiting for bytes that never come
+             uart->RX_parse_msg_timeout = clock_ticks + 50;
+
+             // advance to next state
+             uart->RX_parse_msg_state++;
+    case  1: // collect message header
+             if (Uart_RX_FIFO_count(uart) < sizeof(MsgHeader_t)) break;
+
+             // we have enough bytes for the header
+             // get message length
+             // command byte tells us how many bytes are in the message
+             uart->RX_parse_msg_len = Uart_Get_RX_Msg_len(uart->RX_empty_ptr);
+
+             // check header CRC
+             // if command is not in range, or CRC error, discard this message
+             if (!CheckCRC16_LSBit(uart->RX_empty_ptr, sizeof(MsgHeader_t)) ||
+                 (uart->RX_parse_msg_len == 0)) {
+               // header is invalid, skip current sync byte and continue scanning for next sync byte
+               uart->RX_parse_msg_invalid_header_err_cnt++;
+               Uart_RX_discard_chars(uart, 1);
+               uart->RX_parse_msg_state = 0;
+               break;
+               }
+
+             // header CRC and command byte are valid
+             // advance to next state
+             uart->RX_parse_msg_state++;
+    case  2: // collect complete message
+             if (Uart_RX_FIFO_count(uart) >= uart->RX_parse_msg_len) {
+               // we have a complete message
+               // if the CRC is good, we process the packet
+               // if the CRC is bad, we discard the packet
+               // either way, we still need to restart the scanner to parse the next message
+               uart->RX_parse_msg_state = 0;
+               
+               // check message CRC, including sync byte
+               // if CRC error, discard this message
+               if (CheckCRC16_LSBit(uart->RX_empty_ptr, uart->RX_parse_msg_len)) {
+                 // message CRC is valid, we have a valid header and a valid message
+                 // process the message, then discard the message
+                 uart->RX_parse_msg_OK_cnt++;
+                 Process_msg(uart, uart->RX_empty_ptr);
+                 Uart_RX_discard_chars(uart, uart->RX_parse_msg_len);
+                 }
+               else {
+                 // message is invalid, restart the scanner
+                 uart->RX_parse_msg_invalid_msg_err_cnt++;
+                 Uart_RX_discard_chars(uart, 1);
+                 }
+               }
+             break;
+    }
+}
+
+//------------------------------------------------------------------------------
+// radio uart parser
+//------------------------------------------------------------------------------
+
+//------------------------------------------------------------------------------
+// used in ball crossing event report
+uint16_t TimeStampCrossingCounter_100ms    = 0;         // time stamp at crossing
+uint16_t TimeStampColorChangeCounter_100ms = 0;         // time stamp at color change
+
+uint16_t TimeStampCounter_100ms =     0;                // count up time stamp
+uint16_t TimeStampCounter_ms    =   100;
+bool     TimeStampCounterPaused = false;
+
+//------------------------------------------------------------------------------
+// 0x80=global fault 0x10=battery low 0x02=system running 0x01=system fault
+uint8_t System_flags = 0x02;
+
+// battery level is 0..100%, represented in hex ascii bytes:
+// 100% = '6', '4' in hex ascii bytes
+uint16_t Battery_level = 50;
+
+//------------------------------------------------------------------------------
+// exact match
+// string 1, string 2, len
+bool RX_String_Match(uint8_t *s1, uint8_t *s2, int16_t len) {
+  while (--len >= 0) if (*s1++ != *s2++) return false;
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+// match with mask
+// one-bits in the mask determine the bits of interest
+// string 1, string 2, mask, len
+bool RX_String_Mask_Match(uint8_t *s1, uint8_t *s2, uint8_t *mask, int16_t len) {
+  while (--len >= 0) if ((*s1++ ^ *s2++) & *mask++) return false;
+
+  return true;
+}
+
+//------------------------------------------------------------------------------
+// convert hex nibble into ascii character
+uint8_t Convert_hex_to_ASCII(uint16_t x) {
+  // assure 0x00..0x0f
+  x &= 0x0f;
+
+  // check for 0..9
+  if (x < 10) return x + '0';
+
+  // must be in the range A..F
+  return x + 'A' - 10;
+}
+
+//------------------------------------------------------------------------------
+// convert one ascii character representing a hex nibble into uint16
+//
+// '0' = 0x30
+// '1' = 0x31
+// '2' = 0x32
+// '3' = 0x33
+// '4' = 0x34
+// '5' = 0x35
+// '6' = 0x36
+// '7' = 0x37
+// '8' = 0x38
+// '9' = 0x39
+// 'A' = 0x41      'a' = 0x61
+// 'B' = 0x42      'b' = 0x62
+// 'C' = 0x43      'c' = 0x63
+// 'D' = 0x44      'd' = 0x64
+// 'E' = 0x45      'e' = 0x65
+// 'F' = 0x46      'f' = 0x66
+//
+uint16_t Convert_ASCII_byte_to_uint16(uint8_t c) {
+  // assure upper-case only
+  if (c >= 'a') c -= ('a' - 'A');                       // c -= 0x20
+
+  // assume c is in the range of 0..9
+  // remove '0' offset
+  c -= '0';
+  if (c < 10) return c;
+
+  // assume c is in the range of A..F
+  // undo '0' offset, remove 'A' offset, and add 10 (+ '0' - 'A' + 10 = -7)
+  c -= 7;
+  if (c < 16) return c;
+
+  // invalid input
+  return 0;
+}
+
+//------------------------------------------------------------------------------
+// convert two ascii characters representing two hex nibbles into uint16
+uint16_t Convert_ASCII_double_byte_to_uint16(uint8_t *s) {
+  uint16_t x;
+
+  x  = Convert_ASCII_byte_to_uint16(s[0]) << 4;         // upper nibble
+  x |= Convert_ASCII_byte_to_uint16(s[1]) << 0;         // lower nibble
+
+  return x;
+}
+
+//------------------------------------------------------------------------------
+// convert four ascii characters representing four hex nibbles into uint16
+uint16_t Convert_ASCII_quad_byte_to_uint16(uint8_t *s) {
+  uint16_t x;
+
+  x  = Convert_ASCII_byte_to_uint16(s[0]) << 12;        // upper nibble
+  x |= Convert_ASCII_byte_to_uint16(s[1]) <<  8;
+  x |= Convert_ASCII_byte_to_uint16(s[2]) <<  4;
+  x |= Convert_ASCII_byte_to_uint16(s[3]) <<  0;        // lower nibble
+
+  return x;
+}
+
+//------------------------------------------------------------------------------
+// FRAM
+//------------------------------------------------------------------------------
+extern SPI_HandleTypeDef hspi4;
+#define FRAM_SPI         hspi4
+volatile bool FRAM_tx_busy = false;
+volatile bool FRAM_rx_busy = false;
+
+//------------------------------------------------------------------------------
+void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
+  if (hspi == &FRAM_SPI) {
+    FRAM_tx_busy = false;
+    FRAM_rx_busy = false;
+    }
+}
+
+#define MSB_addr(x) ((x >> 8) & 0xff)
+#define LSB_addr(x) ((x >> 0) & 0xff)
+
+//------------------------------------------------------------------------------
+void FRAM_write(uint16_t addr, uint8_t *tx_data, int16_t tx_data_len) {
+  uint8_t FRAM_wren      [] = {0x06};
+  uint8_t FRAM_write_addr[] = {0x02, MSB_addr(addr), LSB_addr(addr)};
+  uint8_t rx_dummy       [10];
+
+  //----------------------------------------------------------------------------
+  // chip select low
+  HAL_GPIO_WritePin(FRAM_nCS_GPIO_Port, FRAM_nCS_Pin, GPIO_PIN_RESET);
+
+  // output write enable command
+  FRAM_tx_busy = true;
+  HAL_SPI_TransmitReceive_DMA(&FRAM_SPI, FRAM_wren, rx_dummy, sizeof(FRAM_wren));               // tx, rx, size
+  while (FRAM_tx_busy) {};
+
+  // chip select high
+  HAL_GPIO_WritePin(FRAM_nCS_GPIO_Port, FRAM_nCS_Pin, GPIO_PIN_SET);
+
+  //----------------------------------------------------------------------------
+  // chip select low
+  HAL_GPIO_WritePin(FRAM_nCS_GPIO_Port, FRAM_nCS_Pin, GPIO_PIN_RESET);
+
+  // output write command and address
+  FRAM_tx_busy = true;
+  HAL_SPI_TransmitReceive_DMA(&FRAM_SPI, FRAM_write_addr, rx_dummy, sizeof(FRAM_write_addr));   // tx, rx, size
+  while (FRAM_tx_busy) {};
+
+  while (tx_data_len > 0) {
+    int16_t len = tx_data_len;
+    if (len > sizeof(rx_dummy)) len = sizeof(rx_dummy);
+
+    // write data
+    FRAM_tx_busy = true;
+    HAL_SPI_TransmitReceive_DMA(&FRAM_SPI, tx_data, rx_dummy, len);                             // tx, rx, size
+    while (FRAM_tx_busy) {};
+
+    tx_data     += len;
+    tx_data_len -= len;
+    }
+
+  // chip select high
+  HAL_GPIO_WritePin(FRAM_nCS_GPIO_Port, FRAM_nCS_Pin, GPIO_PIN_SET);
+}
+
+//------------------------------------------------------------------------------
+void FRAM_read(uint16_t addr, uint8_t *rx_data, int16_t rx_data_len) {
+  uint8_t FRAM_read_addr[] = {0x03, MSB_addr(addr), LSB_addr(addr)};
+  uint8_t rx_dummy      [] = {0, 0, 0};
+  uint8_t tx_dummy      [] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+  //----------------------------------------------------------------------------
+  // chip select low
+  HAL_GPIO_WritePin(FRAM_nCS_GPIO_Port, FRAM_nCS_Pin, GPIO_PIN_RESET);
+
+  // output read command and address
+  FRAM_rx_busy = true;
+  HAL_SPI_TransmitReceive_DMA(&FRAM_SPI, FRAM_read_addr, rx_dummy, sizeof(FRAM_read_addr));     // tx, rx, size
+  while (FRAM_rx_busy) {};
+
+  while (rx_data_len > 0) {
+    int16_t len = rx_data_len;
+    if (len > sizeof(tx_dummy)) len = sizeof(tx_dummy);
+
+    // read data
+    FRAM_rx_busy = true;
+    HAL_SPI_TransmitReceive_DMA(&FRAM_SPI, tx_dummy, rx_data, len);                             // tx, rx, size
+    while (FRAM_rx_busy) {};
+
+    rx_data     += len;
+    rx_data_len -= len;
+    }
+
+  // chip select high
+  HAL_GPIO_WritePin(FRAM_nCS_GPIO_Port, FRAM_nCS_Pin, GPIO_PIN_SET);
+}
+
+
+//------------------------------------------------------------------------------
+#if 1
+void FRAM_test(void) {
+}
+#else
+//------------------------------------------------------------------------------
+uint16_t rx_data;
+uint16_t tx_data;
+uint32_t FRAM_error = 0;
+void FRAM_test(void) {
+  uint16_t i;
+
+  #if 0
+  tx_data = 0;
+  for (i = 0; i < 16384; i++) {
+    FRAM_write(i * sizeof(tx_data), (uint8_t *) &tx_data, sizeof(tx_data));
+    tx_data++;
+    }
+  #endif
+
+  tx_data = 0;
+  for (i = 0; i < 16384; i++) {
+    FRAM_read(i * sizeof(rx_data), (uint8_t *) &rx_data, sizeof(rx_data));
+    if (rx_data != tx_data) FRAM_error++;
+    tx_data++;
+    }
+
+  __NOP();
+}
+#endif
+
+//------------------------------------------------------------------------------
+// packet parser
+#define COMMAND_BYTE            0x82
+#define COMMAND_PACKET_LEN      20
+
+//------------------------------------------------------------------------------
+// power up initialization strings
+//------------------------------------------------------------------------------
+const uint8_t Radio_RX_init_string[] = "?SN?\r";                        // this is a null terminated string, so use size()-1 to ignore extra null
+#define RADIO_INIT_LEN (sizeof(Radio_RX_init_string)-1)
+
+//------------------------------------------------------------------------------
+uint16_t Serial_Number = 124;
+
+//------------------------------------------------------------------------------
+// read Serial_Number from FRAM
+void Read_SN(void) {
+  FRAM_read(0, (uint8_t *) &Serial_Number, sizeof(Serial_Number));
+}
+
+//------------------------------------------------------------------------------
+// write Serial_Number to FRAM
+void Write_SN(void) {
+  FRAM_write(0, (uint8_t *) &Serial_Number, sizeof(Serial_Number));
+}
+
+//------------------------------------------------------------------------------
+// send Serial_Number to radio (and then on to USB term)
+void Show_Serial_Number(uart_t *uart) {
+  uint8_t  str[6];                              // dddddd
+  uint16_t num = Serial_Number;
+  int16_t  i;
+
+  for (i = sizeof(str)-1; i >= 0; i--) {
+    str[i] = (num % 10) + '0';
+    num /= 10;
+    }
+
+  Uart_TX_put_buf(uart, str, sizeof(str));
+}
+
+//------------------------------------------------------------------------------
+// Radio_TX_init_string is a null terminated string, so use size()-1 to ignore extra null
+void Process_Radio_RX_init_string(uart_t *uart) {
+  // output " TTarget ID:dddddd\r"
+  Uart_TX_put_str(uart, " TTarget ID:");
+  Show_Serial_Number(uart);
+  Uart_TX_put_char(uart, '\r');
+}
+
+//------------------------------------------------------------------------------
+// command 01: Request General Machine Status
+// TOCA Target Goal Communication Definition Rev 09 page 6
+//------------------------------------------------------------------------------
+const uint8_t Radio_RX_General_Machine_Status_Request[] = {             // mask       |
+  COMMAND_BYTE,                                                         // 0xff       | command=0x82
+  '0','1',                                                              // 0xff, 0xff | command descriptor: request general status
+  '0','1',                                                              // 0x00, 0x00 | set machine ID (goal address 01..04), not used
+  '0','1',                                                              // 0xff, 0xff | command subtype, always "01"
+  '0','0',                                                              // 0xff, 0xff | not used, always "00"
+  '0','0',                                                              // 0xff, 0xff | not used, always "00"
+  '0','0',                                                              // 0xff, 0xff | not used, always "00"
+  '0','0',                                                              // 0xff, 0xff | not used, always "00"
+  '0','0',                                                              // 0xff, 0xff | not used, always "00"
+  '0','0',                                                              // 0xff, 0xff | not used, always "00"
+  0xc2                                                                  // 0xff       | packet end
+};
+const uint8_t Radio_RX_General_Machine_Status_Request_mask[] = {
+  0xff,
+  0xff, 0xff,
+  0x00, 0x00,
+  0xff, 0xff,
+  0xff, 0xff,
+  0xff, 0xff,
+  0xff, 0xff,
+  0xff, 0xff,
+  0xff, 0xff,
+  0xff, 0xff,
+  0xff
+};
+
+//------------------------------------------------------------------------------
+// response 01: General Machine Status
+// TOCA Target Goal Communication Definition Rev 09 page 15
+//------------------------------------------------------------------------------
+typedef __packed struct {
+  uint8_t  command;                                                             // command                                        = 0x83
+  uint8_t  command_descriptor[2];                                               // command descriptor: general machine status     = '0','1'
+  uint8_t  machine_id[2];                                                       // machine ID (goal address 01..04), not used = '0','0' (example)
+  uint8_t  response_subtype[2];                                                 // command subtype, always "01"
+  uint8_t  ff[2];                                                               // "80"= global fault "10"=battery low "02"=system running "01"=system fault
+  uint8_t  battery_level[2];                                                    // 0..100%
+  uint8_t  firmware_major_revision[4];                                          // high byte, low byte
+  uint8_t  firmware_minor_revision[4];                                          // high byte, low byte
+  uint8_t  eof;                                                                 // 0xc3=end of packet
+} Radio_TX_General_Machine_Status_Response_Msg_t;
+
+//------------------------------------------------------------------------------
+Radio_TX_General_Machine_Status_Response_Msg_t Radio_TX_General_Machine_Status_Response_Msg = {
+  .command                 = 0x83,
+  .command_descriptor      = {'0','1'},
+  .machine_id              = {'0','0'},
+  .response_subtype        = {'0','1'},
+  .firmware_major_revision = {'0','0','0','0'},                                 // firmware revision = 00.08, max 99.99
+<<<<<<< HEAD
+  .firmware_minor_revision = {'0','0','0','8'},
+=======
+  .firmware_minor_revision = {'0','0','0','8'},                                 // 0x0008 = 8 decimal
+>>>>>>> bdada8b... Change firmware revision from 0.06 to 0.08
+  .eof                     = 0xc3
+};
+
+const char *emitter_part_number  = "803733";                                    // 803733v0.08 emitter  OTA
+const char *detector_part_number = "803734";                                    // 803734v0.08 detector OTA
+
+//------------------------------------------------------------------------------
+// the version CRC for the matching emitter  firmware image is located in [0]
+// the version CRC for the          detector firmware image is located in [1]
+// (the location of the detector CRC is specified in the linker command file)
+// together, these CRCs define a matched set of firmware images
+// get the initialization value from the emitter build
+// copy / paste it here byte-reversed
+// then build the detector so that the matching emitter CRC
+// is embedded in the detector build
+const uint32_t Emitter_detector_matching_version_CRCs[1] @ 0x0801bff8 = {0x3B118CBCul};
+
+//------------------------------------------------------------------------------
+uint16_t Get_firmware_major_revision(void) {return Convert_ASCII_quad_byte_to_uint16(Radio_TX_General_Machine_Status_Response_Msg.firmware_major_revision);}
+uint16_t Get_firmware_minor_revision(void) {return Convert_ASCII_quad_byte_to_uint16(Radio_TX_General_Machine_Status_Response_Msg.firmware_minor_revision);}
+
+//------------------------------------------------------------------------------
+// setting the version to 00.00 forces an OTA update
+void Force_OTA_update(void) {
+  int16_t i;
+
+  for (i = 0; i < 4; i++) {
+    Radio_TX_General_Machine_Status_Response_Msg.firmware_major_revision[i] = '0';
+    Radio_TX_General_Machine_Status_Response_Msg.firmware_minor_revision[i] = '0';
+    }
+}
+
+//------------------------------------------------------------------------------
+// request general machine status
+void Process_Radio_RX_General_Machine_Status_Request(uart_t *uart) {
+  Radio_TX_General_Machine_Status_Response_Msg.ff[0]            = Convert_hex_to_ASCII(System_flags >> 4);
+  Radio_TX_General_Machine_Status_Response_Msg.ff[1]            = Convert_hex_to_ASCII(System_flags >> 0);
+
+  Radio_TX_General_Machine_Status_Response_Msg.battery_level[0] = Convert_hex_to_ASCII(Battery_level >> 4);
+  Radio_TX_General_Machine_Status_Response_Msg.battery_level[1] = Convert_hex_to_ASCII(Battery_level >> 0);
+
+  Uart_TX_put_buf(uart, (uint8_t *) &Radio_TX_General_Machine_Status_Response_Msg, sizeof(Radio_TX_General_Machine_Status_Response_Msg));
+}
+
+//------------------------------------------------------------------------------
+// command 03: Red/Green/Blue Indicator Control
+// TOCA Target Goal Communication Definition Rev 09 page 8
+//------------------------------------------------------------------------------
+const uint8_t Radio_RX_RGB_Indicator_Control[] = {                      // mask       |
+  COMMAND_BYTE,                                                         // 0xff       | command=0x82
+  '0','3',                                                              // 0xff, 0xff | command descriptor: RGB indicator control
+  '0','1',                                                              // 0x00, 0x00 | machine ID (goal address 01..04), not used
+  '3','1',                                                              // 0x00, 0x00 | (example only) sc=31=both sides green
+  'F','F',                                                              // 0x00, 0x00 | (example only) r1=FF (LEDs all on)    upper  8 LEDs
+  'F','F',                                                              // 0x00, 0x00 | (example only) r2=FF (LEDs all on)    middle 8 LEDs
+  'F','F',                                                              // 0x00, 0x00 | (example only) r3=FF (LEDs all on)    lower  8 LEDs
+  '0','0',                                                              // 0x00, 0x00 | (example only) f1=00 (flash disabled) upper  8 LEDs
+  '0','0',                                                              // 0x00, 0x00 | (example only) f2=00 (flash disabled) middle 8 LEDs
+  '0','0',                                                              // 0x00, 0x00 | (example only) f3=00 (flash disabled) lower  8 LEDs
+  0xc2                                                                  // 0xff       | packet end
+};
+const uint8_t Radio_RX_RGB_Indicator_Control_mask[] = {
+  0xff,
+  0xff, 0xff,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0xff
+};
+typedef __packed struct {
+  uint8_t  command;                                                             // command                                    = 0x82
+  uint8_t  command_descriptor[2];                                               // command descriptor: RGB indicator control  = '0','3'
+  uint8_t  machine_id[2];                                                       // machine ID (goal address 01..04), not used = '0','1'
+  uint8_t  side;                                                                // '1'=left '2'=right '3'=both
+  uint8_t  color;                                                               // '0'=blue '1'=green '2'=red '3'=yellow
+  uint8_t  r1[2];                                                               // 'F','F', (example only) r1=FF (LEDs all on)    upper  8 LEDs
+  uint8_t  r2[2];                                                               // 'F','F', (example only) r2=FF (LEDs all on)    middle 8 LEDs
+  uint8_t  r3[2];                                                               // 'F','F', (example only) r3=FF (LEDs all on)    lower  8 LEDs
+  uint8_t  f1[2];                                                               // '0','0', (example only) f1=00 (flash disabled) upper  8 LEDs
+  uint8_t  f2[2];                                                               // '0','0', (example only) f2=00 (flash disabled) middle 8 LEDs
+  uint8_t  f3[2];                                                               // '0','0', (example only) f3=00 (flash disabled) lower  8 LEDs
+  uint8_t  eof;                                                                 // 0xc2=end of packet
+} Radio_RX_RGB_Indicator_Control_Msg_t;
+
+//------------------------------------------------------------------------------
+// control on/off, blinking, and color
+void Process_Radio_RX_RGB_Indicator_Control(uint8_t *pRGB_Indicator_Control_Msg) {
+  Radio_RX_RGB_Indicator_Control_Msg_t *pMsg = (Radio_RX_RGB_Indicator_Control_Msg_t *) pRGB_Indicator_Control_Msg;
+
+  // light show is controlled by mobile app
+  LightShow_Selector = -1;
+
+  // latch timestamp of color change
+  TimeStampColorChangeCounter_100ms = TimeStampCounter_100ms;
+
+  uint16_t side  = Convert_ASCII_byte_to_uint16       (pMsg->side);
+  uint16_t color = Convert_ASCII_byte_to_uint16       (pMsg->color);
+  uint16_t r1    = Convert_ASCII_double_byte_to_uint16(pMsg->r1);
+  uint16_t r2    = Convert_ASCII_double_byte_to_uint16(pMsg->r2);
+  uint16_t r3    = Convert_ASCII_double_byte_to_uint16(pMsg->r3);
+  uint16_t f1    = Convert_ASCII_double_byte_to_uint16(pMsg->f1);
+  uint16_t f2    = Convert_ASCII_double_byte_to_uint16(pMsg->f2);
+  uint16_t f3    = Convert_ASCII_double_byte_to_uint16(pMsg->f3);
+
+  uint32_t LEDs_on;
+  uint32_t LEDs_blink;
+  uint32_t RGB;
+
+  // r1 is the upper  8 bits
+  // r2 is the middle 8 bits
+  // r3 is the lower  8 bits
+  // which totals 24 LEDs, but there are 32 LEDs
+  // map r1 to 31..24
+  // gap       23..20
+  // map r2 to 19..12
+  // gap       11.. 8
+  // map r3 to  7.. 0
+  // to fill the gaps, we propagate:
+  // bit 24 into 23 and 22
+  // bit 19 into 21 and 20
+  // bit 12 into 11 and 10
+  // bit  7 into  9 and  8
+  LEDs_on = (r1 << 24)
+          | (r2 << 12)
+          | (r3 <<  0);
+
+  if (r1 & 0x01) LEDs_on |= (3ul << 22);
+  if (r2 & 0x80) LEDs_on |= (3ul << 20);
+  if (r2 & 0x01) LEDs_on |= (3ul << 10);
+  if (r3 & 0x80) LEDs_on |= (3ul <<  8);
+
+  LEDs_blink = (f1 << 24)
+             | (f2 << 12)
+             | (f3 <<  0);
+
+  if (f1 & 0x01) LEDs_blink |= (3ul << 22);
+  if (f2 & 0x80) LEDs_blink |= (3ul << 20);
+  if (f2 & 0x01) LEDs_blink |= (3ul << 10);
+  if (f3 & 0x80) LEDs_blink |= (3ul <<  8);
+
+  switch (color) {
+    case 0: RGB = 0x0000fful; break;    // blue
+    case 1: RGB = 0x00ff00ul; break;    // green
+    case 2: RGB = 0xff0000ul; break;    // red
+    case 3: RGB = 0x7f7f00ul; break;    // yellow = red+green
+    }
+
+  // 1=left  side (emitter)
+  // 2=right side (detector)
+  // 3=both  sides
+  if (side & 2) {
+    // right side (detector)
+    RGB_indicators.LEDs1_on    = LEDs_on;
+    RGB_indicators.LEDs1_blink = LEDs_blink;
+    RGB_indicators.RGB1        = RGB;
+    }
+  if (side & 1) {
+    // left side (emitter)
+    // send an RGB indicator message to the emitter
+    __NOP();
+    }
+}
+
+//------------------------------------------------------------------------------
+// command 07: Red/Green/Blue Indicator Crossing Action Control
+// TOCA Target Goal Communication Definition Rev 09 page 12
+//------------------------------------------------------------------------------
+const uint8_t Radio_RX_RGB_Indicator_Crossing_Action_Control[] = {      // mask       |
+  COMMAND_BYTE,                                                         // 0xff       | command=0x82
+  '0','7',                                                              // 0xff, 0xff | command descriptor: RGB indicator control
+  '0','1',                                                              // 0x00, 0x00 | machine ID (goal address 01..04), not used
+  '3','2',                                                              // 0x00, 0x00 | (example only) sc=32=both sides red
+  '0','0',                                                              // 0x00, 0x00 | (example only) l1=00 upper  8 LEDs
+  '0','0',                                                              // 0x00, 0x00 | (example only) l2=00 middle 8 LEDs
+  '0','0',                                                              // 0x00, 0x00 | (example only) l3=00 lower  8 LEDs
+  '4','1',                                                              // 0x00, 0x00 | (example only) ff=41 (function)
+  '1','e',                                                              // 0x00, 0x00 | (example only) f2=00 (duration)
+  '0','0',                                                              // 0x00, 0x00 | (example only) f3=00 (always zero)
+  0xc2                                                                  // 0xff       | packet end
+};
+const uint8_t Radio_RX_RGB_Indicator_Crossing_Action_Control_mask[] = {
+  0xff,
+  0xff, 0xff,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0xff
+};
+typedef __packed struct {
+  uint8_t  command;                                                             // command = 0x82
+  uint8_t  command_descriptor[2];                                               // command descriptor: RGB indicator crossing action control = '0','7'
+  uint8_t  machine_id[2];                                                       // machine ID (goal address 01..04), not used = '0','1'
+  uint8_t  side;                                                                // '1'=left '2'=right '3'=both
+  uint8_t  color;                                                               // '0'=blue '1'=green '2'=red '3'=yellow
+  uint8_t  l1[2];                                                               // '0','0', (example only)       upper  8 LEDs
+  uint8_t  l2[2];                                                               // '0','0', (example only)       middle 8 LEDs
+  uint8_t  l3[2];                                                               // '0','0', (example only)       lower  8 LEDs
+  uint8_t  function;                                                            // '4',     (example only)       (function)
+  uint8_t  repeat_count;                                                        // '1',     (example only)       (repeat count = 1)
+  uint8_t  dd[2];                                                               // '0','0', (example only) dd=1e (duration = 30*10 = 300 ms)
+  uint8_t  zz[2];                                                               // '0','0', (example only) zz=00 (always zero)
+  uint8_t  eof;                                                                 // 0xc2=end of packet
+} Radio_RX_RGB_Indicator_Crossing_Action_Control_Msg_t;
+
+//------------------------------------------------------------------------------
+// extract duration
+// duration is in 10 ms ticks, so multiply duration by 10 to convert to milliseconds
+// ignore durations of zero time
+// this is possible with function/repeat count = 0x80
+// which should be interpreted as a "null" function, so no action taken
+void Process_Radio_RX_RGB_Indicator_Crossing_Action_Control(uint8_t *pRGB_Indicator_Crossing_Action_Control_Msg) {
+  Radio_RX_RGB_Indicator_Crossing_Action_Control_Msg_t *pMsg = (Radio_RX_RGB_Indicator_Crossing_Action_Control_Msg_t *) pRGB_Indicator_Crossing_Action_Control_Msg;
+  uint16_t duration = Convert_ASCII_double_byte_to_uint16(pMsg->dd);
+
+  if (duration) RGB_indicators.ball_crossing_time_ms = duration * 10;           // convert to milliseconds
+}
+
+//------------------------------------------------------------------------------
+// emitter and detector code image packets
+//------------------------------------------------------------------------------
+const uint8_t Radio_RX_Emitter_code_image[] = {         // mask       |
+  0x85,                                                 // 0xff       | command=0x85
+  0, 0,                                                 // 0x00, 0x00 | packet number (0=address 0x00000 1=address 0x00010 ...)
+  0, 0,                                                 // 0x00, 0x00 | packet data (16 bytes)
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0xc5                                                  // 0xff       | packet end
+};
+const uint8_t Radio_RX_Detector_code_image[] = {        // mask       |
+  0x86,                                                 // 0xff       | command=0x86
+  0, 0,                                                 // 0x00, 0x00 | packet number (0=address 0x00000 1=address 0x00010 ...)
+  0, 0,                                                 // 0x00, 0x00 | packet data (16 bytes)
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0xc6                                                  // 0xff       | packet end
+};
+const uint8_t Radio_RX_Restart_now[] = {                // mask       |
+  0x87,                                                 // 0xff       | command=0x86
+  0, 0,                                                 // 0x00, 0x00 | don't-care data (18 bytes)
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0, 0,                                                 // 0x00, 0x00 |
+  0xc7                                                  // 0xff       | packet end
+};
+#define Radio_RX_Emitter_code_image_mask        Radio_RX_code_image_mask
+#define Radio_RX_Detector_code_image_mask       Radio_RX_code_image_mask
+#define Radio_RX_Restart_now_mask               Radio_RX_code_image_mask
+const uint8_t Radio_RX_code_image_mask[] = {
+  0xff,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0x00, 0x00,
+  0xff
+};
+typedef __packed struct {
+  uint8_t  command;                                                                     // command = 0x85/0x86
+  uint16_t packet_number;                                                               // code image address = packet number * 16
+  uint32_t data[4];                                                                     // 16 bytes of data
+  uint8_t  eof;                                                                         // 0xc5/0x86=end of packet
+} Radio_RX_code_image_Msg_t;
+
+//------------------------------------------------------------------------------
+void Process_Radio_RX_Emitter_code_image(uint8_t *pCode_image_Msg) {
+  Radio_RX_code_image_Msg_t *pMsg = (Radio_RX_code_image_Msg_t *) pCode_image_Msg;
+
+  // pass packet to emitter
+  Send_EmitterCodeImageMsg(pMsg->packet_number, (uint32_t *) &pMsg->data);
+}
+
+//------------------------------------------------------------------------------
+// the bootloader will support up to 112 k bytes
+// the detector build does not have enough ram to capture an entire 112 k byte image
+// so we use 96 k bytes instead
+#define DETECTOR_IMAGE_SIZE (uint32_t) (96 * 1024)                                      // 112k bytes max in bootloader
+#pragma data_alignment=16
+uint32_t Detector_code_image[DETECTOR_IMAGE_SIZE/4];
+void Process_Radio_RX_Detector_code_image(uint8_t *pCode_image_Msg) {
+  Radio_RX_code_image_Msg_t *pMsg = (Radio_RX_code_image_Msg_t *) pCode_image_Msg;      // pointer to message packet
+  uint16_t  index                 = pMsg->packet_number;                                // packet number
+  uint32_t *data                  = (uint32_t *) &pMsg->data;                           // pointer to packet data
+  uint32_t *code                  = &Detector_code_image[index * 4];                    // pointer to code image
+
+  // init the code image when first packet of a fresh download
+  if (index == 0) {
+    uint16_t i;
+    for (i = 0; i < DETECTOR_IMAGE_SIZE/4; i++) Detector_code_image[i] = ~0ul;
+    }
+
+  // index * 16 is byte offset into code array
+  // check (index * 16) < sizeof(Detector_code_image)
+  if (index < (sizeof(Detector_code_image)/16)) {
+    // copy 16 bytes into code image
+    code[0] = data[0];
+    code[1] = data[1];
+    code[2] = data[2];
+    code[3] = data[3];
+    }
+}
+
+//------------------------------------------------------------------------------
+void Process_Radio_RX_Radio_RX_Restart_now(uint8_t *pCode_image_Msg) {
+  // erase sector 7
+  Erase_flash_sector(FLASH_SECTOR_7);           // 128 kb
+
+  // copy code image to secondary code image
+  Program_flash_sector_word(ADDR_FLASH_SECTOR_7, (uint32_t) &Detector_code_image, DETECTOR_IMAGE_SIZE/4);
+
+  // notify emitter to restart now
+  // emitter will reset, causing detector to lose power
+  // after power is restored to detector, the detector bootloader will run
+  Send_EmitterRestartNowMsg();
+}
+
+//------------------------------------------------------------------------------
+void RX_ParseRadioTask(uart_t *uart, uint32_t clock_ticks) {
+  int16_t  FIFO_count = Uart_RX_FIFO_count(uart);
+  uint8_t *pMsg       = uart->RX_empty_ptr;
+  uint16_t discard_len;
+
+  if (FIFO_count >= COMMAND_PACKET_LEN) {
+    discard_len = COMMAND_PACKET_LEN;
+
+    // request general machine status 0x82, descriptor '0','1'
+    if      (RX_String_Mask_Match(pMsg,
+                                  (uint8_t *) Radio_RX_General_Machine_Status_Request,
+                                  (uint8_t *) Radio_RX_General_Machine_Status_Request_mask,
+                                  COMMAND_PACKET_LEN)) Process_Radio_RX_General_Machine_Status_Request(uart);
+
+    // RGB indicator control 0x82, descriptor '0','3'
+    else if (RX_String_Mask_Match(pMsg,
+                                  (uint8_t *) Radio_RX_RGB_Indicator_Control,
+                                  (uint8_t *) Radio_RX_RGB_Indicator_Control_mask,
+                                  COMMAND_PACKET_LEN)) Process_Radio_RX_RGB_Indicator_Control(pMsg);
+
+    // RGB indicator crossing action control 0x82, descriptor '0','7'
+    else if (RX_String_Mask_Match(pMsg,
+                                  (uint8_t *) Radio_RX_RGB_Indicator_Crossing_Action_Control,
+                                  (uint8_t *) Radio_RX_RGB_Indicator_Crossing_Action_Control_mask,
+                                  COMMAND_PACKET_LEN)) Process_Radio_RX_RGB_Indicator_Crossing_Action_Control(pMsg);
+
+    // emitter code image packet 0x85
+    else if (RX_String_Mask_Match(pMsg,
+                                  (uint8_t *) Radio_RX_Emitter_code_image,
+                                  (uint8_t *) Radio_RX_Emitter_code_image_mask,
+                                  COMMAND_PACKET_LEN)) Process_Radio_RX_Emitter_code_image(pMsg);
+
+    // detector code image packet 0x86
+    else if (RX_String_Mask_Match(pMsg,
+                                  (uint8_t *) Radio_RX_Detector_code_image,
+                                  (uint8_t *) Radio_RX_Detector_code_image_mask,
+                                  COMMAND_PACKET_LEN)) Process_Radio_RX_Detector_code_image(pMsg);
+
+    // resetart-now packet 0x87
+    else if (RX_String_Mask_Match(pMsg,
+                                  (uint8_t *) Radio_RX_Restart_now,
+                                  (uint8_t *) Radio_RX_Restart_now_mask,
+                                  COMMAND_PACKET_LEN)) Process_Radio_RX_Radio_RX_Restart_now(pMsg);
+
+    // message not recognized, discard one byte and try again later
+    else discard_len = 1;
+
+    // at this point, we have either processed a valid message or we have not
+    // for all valid messages,   discard 20 bytes
+    // for all invalid messages, discard one byte and try again later
+    Uart_RX_discard_chars(uart, discard_len);
+    }
+  else if (FIFO_count >= RADIO_INIT_LEN) {
+    // Radio_RX_init_string ?SN?\r
+    if (RX_String_Match(pMsg,
+                        (uint8_t *) Radio_RX_init_string,
+                        RADIO_INIT_LEN)) {
+      Process_Radio_RX_init_string(uart);
+      Uart_RX_discard_chars(uart, RADIO_INIT_LEN);
+      }
+    }
+  else if (FIFO_count >= 1) {
+    static  int16_t command_line_state = 0;
+    static uint16_t num;
+    static uint16_t digit_cnt;
+           uint16_t echo = *pMsg;       // character in original case
+           uint16_t data = *pMsg;       // character in upper    case
+
+    // convert lower case to upper case
+    if ((data >= 'a') && (data <= 'z')) data += 'A' - 'a';
+
+    // assume the parser will consume the character
+    discard_len = 1;
+
+    // parse the command set
+    switch (command_line_state) {
+      case  0: // not doing command set parsing yet
+               // %     start command set parsing
+               // M     memory update
+               if (data == '\r') {
+                 Uart_TX_put_str(uart, "\r\n>");
+                 }
+               else if (data == '%') {
+                 // output "COMMAND SET: "
+                 Uart_TX_put_str(uart, "COMMAND SET: ");
+                 command_line_state = 1;
+                 }
+               else if (data == 'M') {
+                 // memory update
+                 // output "Memory Updated\r\n"
+                 Uart_TX_put_str(uart, "Memory Updated\r\n>");
+
+                 // write Serial_Number to FRAM
+                 Write_SN();
+                 }
+
+               // assume we are constructing a longer string to match other commands:
+               // "?SN?\r"
+               // 0x8x ...         ... 0xcx
+               // do not consume the character
+               else if (data == '?') discard_len = 0;
+               else if (data & 0x80) discard_len = 0;
+
+               // it's not anything we recognize, give error
+               else command_line_state = -2;                    // parsing error
+               break;
+      case  1: // start command set parsing
+               // consume the character
+               // "SN\n"        show serial number and end command set parsing
+               // "SNdddd\n"    set serial number and end command set parsing
+               // "\n"          end parsing
+               // <other>       parsing error and end command set parsing
+               if (data == 'S') {
+                 Uart_TX_put_char(uart, echo);                  // echo character
+                 command_line_state = 2;                        // continue parsing
+                 }
+               else if (data == '\n') command_line_state = -1;  // end parsing
+               else                   command_line_state = -2;  // parsing error
+               break;
+      case  2: // continue command set parsing
+               // consume the character
+               // "N\n"        show serial number and end command set parsing
+               // "Ndddd\n"    set  serial number and end command set parsing
+               // <other>      end command set parsing
+               if (data == 'N') {
+                 Uart_TX_put_char(uart, echo);                  // echo character
+                 num                = 0;
+                 digit_cnt          = 0;
+                 command_line_state = 3;
+                 }
+               else command_line_state = -2;                    // parsing error
+               break;
+      case  3: // continue command set parsing
+               // consume the character
+               // "\n"        show serial number and end command set parsing
+               // "dddd\n"    set  serial number and end command set parsing
+               // <other>     end command set parsing
+               if ((data >= '0') && (data <= '9')) {
+                 Uart_TX_put_char(uart, echo);                  // echo character
+                 num = num*10 + data - '0';
+                 digit_cnt++;
+                 }
+               else if (data == '\r') {
+                 // end of line character
+                 // output "\r\n\n SERIAL NUMBER SET (0..9999) <%SN>: "
+                 Uart_TX_put_str(uart, "\r\n\n SERIAL NUMBER SET (0..9999) <%SN>: ");
+
+                 if (digit_cnt > 4) {
+                    // too many digits
+                    command_line_state = -2;                    // parsing error
+                    }
+                 if (digit_cnt > 0) {
+                   // "SNdddd\n"
+                   // set serial number
+                   Serial_Number = num;
+
+                   // show Serial_Number
+                   Show_Serial_Number(uart);
+
+                   // end command set parsing
+                   command_line_state = -1;                     // end parsing
+                   }
+                 else {
+                   // show serial number
+                   Show_Serial_Number(uart);
+
+                   // end command set parsing
+                   command_line_state = -1;                     // end parsing
+                   }
+                 }
+               else command_line_state = -2;                    // parsing error
+               break;
+      }
+
+    // handle parsing errors
+    if (command_line_state <= -2) {
+      // parsing error
+      // output "\r\n\n????"
+      Uart_TX_put_str(uart, "\r\n\n????");
+      command_line_state++;
+      }
+
+    // handle end of command set parsing
+    if (command_line_state <= -1) {
+      // end of command set parsing
+      // output "\r\n\n"
+      Uart_TX_put_str(uart, "\r\n\n>");
+      command_line_state++;
+      }
+
+    // consume parsed characters
+    Uart_RX_discard_chars(uart, discard_len);
+    }
+}
+
+//------------------------------------------------------------------------------
+// status report 02: Ball Crossing Event Report
+// TOCA Target Goal Communication Definition Rev 09 page 24
+//------------------------------------------------------------------------------
+typedef __packed struct {
+  uint8_t  status;                                                              // status                            = 0x84
+  uint8_t  status_descriptor[2];                                                // command descriptor: ball crossing = '0','1'
+  uint8_t  machine_id[2];                                                       // machine ID (goal address 01..04), not used = '0','0' (example)
+  uint8_t  object_type_id[2];                                                   // "00" = non-ball "01" = ball
+  uint8_t  elevation_pct[2];                                                    // "00" =    0% "64" = 100%
+  uint8_t  velocity_pct[2];                                                     // "01" = 1 mph "64" = 100 mph
+  uint8_t  ball_crossing_time_stamp[4];                                         // high byte, low byte
+  uint8_t  color_change_time_stamp[4];                                          // high byte, low byte
+  uint8_t  eof;                                                                 // 0xc4=end of packet
+} Radio_TX_Ball_Crossing_Report_Msg_t;
+
+//------------------------------------------------------------------------------
+Radio_TX_Ball_Crossing_Report_Msg_t Radio_TX_Ball_Crossing_Report_Msg = {
+  .status                   = 0x84,
+  .status_descriptor        = {'0','2'},
+  .machine_id               = {'0','0'},
+  .object_type_id           = {'0','1'},                                        // "00" = non-ball "01" = ball
+  .elevation_pct            = {'0','1'},                                        // "00" =    0% "64" = 100%
+  .velocity_pct             = {'0','1'},                                        // "01" = 1 mph "64" = 100 mph
+  .ball_crossing_time_stamp = {'0','0','0','0'},                                // high byte, low byte
+  .color_change_time_stamp  = {'0','0','0','0'},                                // high byte, low byte
+  .eof                      = 0xc4
+};
+
+//------------------------------------------------------------------------------
+uint16_t Send_Ball_Crossing_Event_counter          = 0;
+uint16_t Sent_Ball_Crossing_Event_counter          = 0;
+bool          Ball_Crossing_Event_Holdoff_complete = true;
+
+//------------------------------------------------------------------------------
+void Send_Ball_Crossing_Event_Holdoff_complete(void) {
+  Ball_Crossing_Event_Holdoff_complete = true;
+}
+
+//------------------------------------------------------------------------------
+// object_type=0 for non-ball
+// object_type=1 for     ball
+void Send_Ball_Crossing_Event(uint16_t object_type,
+                              uint16_t elevation_pct,
+                              uint16_t velocity_pct) {
+
+  // remember that we are starting a holdoff until light curtain is cleared
+  Ball_Crossing_Event_Holdoff_complete = false;
+
+  // latch timestamp of ball crossing event
+  TimeStampCrossingCounter_100ms = TimeStampCounter_100ms;
+
+  // report "ball" or "non-bal"
+  // object_type_id = {'0','0'} for non-ball
+  // object_type_id = {'0','1'} for     ball
+  Radio_TX_Ball_Crossing_Report_Msg.object_type_id[1]           = '0' + object_type;    // object_type=0 for non-ball, object_type=1 for non-ball
+
+  Radio_TX_Ball_Crossing_Report_Msg.elevation_pct[0]            = Convert_hex_to_ASCII(elevation_pct >> 4);
+  Radio_TX_Ball_Crossing_Report_Msg.elevation_pct[1]            = Convert_hex_to_ASCII(elevation_pct >> 0);
+
+  Radio_TX_Ball_Crossing_Report_Msg.velocity_pct[0]             = Convert_hex_to_ASCII(velocity_pct  >> 4);
+  Radio_TX_Ball_Crossing_Report_Msg.velocity_pct[1]             = Convert_hex_to_ASCII(velocity_pct  >> 0);
+
+  Radio_TX_Ball_Crossing_Report_Msg.ball_crossing_time_stamp[0] = Convert_hex_to_ASCII(TimeStampCrossingCounter_100ms >> 12);
+  Radio_TX_Ball_Crossing_Report_Msg.ball_crossing_time_stamp[1] = Convert_hex_to_ASCII(TimeStampCrossingCounter_100ms >>  8);
+  Radio_TX_Ball_Crossing_Report_Msg.ball_crossing_time_stamp[2] = Convert_hex_to_ASCII(TimeStampCrossingCounter_100ms >>  4);
+  Radio_TX_Ball_Crossing_Report_Msg.ball_crossing_time_stamp[3] = Convert_hex_to_ASCII(TimeStampCrossingCounter_100ms >>  0);
+
+  Radio_TX_Ball_Crossing_Report_Msg.color_change_time_stamp[0]  = Convert_hex_to_ASCII(TimeStampColorChangeCounter_100ms >> 12);
+  Radio_TX_Ball_Crossing_Report_Msg.color_change_time_stamp[1]  = Convert_hex_to_ASCII(TimeStampColorChangeCounter_100ms >>  8);
+  Radio_TX_Ball_Crossing_Report_Msg.color_change_time_stamp[2]  = Convert_hex_to_ASCII(TimeStampColorChangeCounter_100ms >>  4);
+  Radio_TX_Ball_Crossing_Report_Msg.color_change_time_stamp[3]  = Convert_hex_to_ASCII(TimeStampColorChangeCounter_100ms >>  0);
+
+  Send_Ball_Crossing_Event_counter++;
+}
+
+//------------------------------------------------------------------------------
+// send ball crossing event to app
+void Send_Ball_Crossing_Event_Task(void) {
+  static uint32_t timeout;
+  static int16_t  state = 0;
+
+  switch (state) {
+    case  0: if ((int16_t) (Send_Ball_Crossing_Event_counter - Sent_Ball_Crossing_Event_counter) < 1) break;
+             Sent_Ball_Crossing_Event_counter++;
+             state++;
+    case  1: // send the ball crossing event report and setup repeat interval
+             Uart_TX_put_buf(&Radio_Uart2, (uint8_t *) &Radio_TX_Ball_Crossing_Report_Msg, sizeof(Radio_TX_Ball_Crossing_Report_Msg));
+
+             // assume non-ball object if repeating
+             Radio_TX_Ball_Crossing_Report_Msg.object_type_id[1] = '0';
+
+             // assume zero velocity if repeating
+             Radio_TX_Ball_Crossing_Report_Msg.velocity_pct[0]   = '0';
+             Radio_TX_Ball_Crossing_Report_Msg.velocity_pct[1]   = '0';
+
+             timeout = HAL_GetTick() + 2162;
+             state++;
+             break;
+    case  2: // stop repeating if holdoff complete
+             // send the message again if timeout
+             if (Ball_Crossing_Event_Holdoff_complete)          state = 0;      // holdoff complete, stop repeating
+             else if (((int32_t) timeout - HAL_GetTick()) <= 0) state = 1;      // timeout, send the message again
+             break;
+    }
+}
+
+#if 0
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
+// test messages for radio
+
+//------------------------------------------------------------------------------
+// RGB indicator control (all on green)
+const uint8_t rx_msg1[] = {
+  0x82,                 // command
+  '0','3',              // command descriptor: RGB indicator control
+  '0','1',              // machine ID (goal address 01..04), not used
+  '3',                  // side: '1'=left '2'=right '3'=both
+  '1',                  // color: '0'=blue '1'=green '2'=red '3'=yellow
+  'F','F',              // r1 is the upper  8 bits
+  'F','F',              // r2 is the middle 8 bits
+  'F','F',              // r3 is the lower  8 bits
+  '0','0',              // f1 is the upper  8 bits
+  '0','0',              // f2 is the middle 8 bits
+  '0','0',              // f3 is the lower  8 bits
+  0xc2                  // packet end
+};
+
+//------------------------------------------------------------------------------
+// general machine status request
+const uint8_t rx_msg2[] = {
+  0x82,                 // command=0x82
+  '0','1',              // command descriptor: request general status
+  '0','1',              // set machine ID (goal address 01..04), not used
+  '0','1',              // command subtype, always "01"
+  '0','0',              // not used, always "00"
+  '0','0',              // not used, always "00"
+  '0','0',              // not used, always "00"
+  '0','0',              // not used, always "00"
+  '0','0',              // not used, always "00"
+  '0','0',              // not used, always "00"
+  0xc2                  // packet end
+};
+
+//------------------------------------------------------------------------------
+// RGB indicator control (all off)
+const uint8_t rx_msg3[] = {
+  0x82,                 // command
+  '0','3',              // command descriptor: RGB indicator control
+  '0','1',              // machine ID (goal address 01..04), not used
+  '3',                  // side: '1'=left '2'=right '3'=both
+  '1',                  // color: '0'=blue '1'=green '2'=red '3'=yellow
+  '0','0',              // r1 is the upper  8 bits
+  '0','0',              // r2 is the middle 8 bits
+  '0','0',              // r3 is the lower  8 bits
+  '0','0',              // f1 is the upper  8 bits
+  '0','0',              // f2 is the middle 8 bits
+  '0','0',              // f3 is the lower  8 bits
+  0xc2                  // packet end
+};
+
+//------------------------------------------------------------------------------
+void Uart_RX_put_char(uart_t *uart, uint8_t data) {
+  int16_t RX_chars_in_FIFO = uart->RX_fill_count - uart->RX_empty_count;
+
+  // check for free space in the RX FIFO
+  if (++RX_chars_in_FIFO <= uart->RX_FIFO_size) {
+    // store RX byte into the FIFO (twice)
+    // helps with packet processing in the RX parser
+    uart->RX_fill_ptr[0]                  = data;
+    uart->RX_fill_ptr[uart->RX_FIFO_size] = data;
+
+    // advance fill counter
+    uart->RX_fill_count++;
+
+    // advance the fill pointer
+    if (++uart->RX_fill_ptr >= uart->RX_end_ptr) uart->RX_fill_ptr -= uart->RX_FIFO_size;
+
+    // update max RX count
+    if (uart->RX_max_count < RX_chars_in_FIFO) uart->RX_max_count = RX_chars_in_FIFO;
+    }
+  else uart->RX_overflow = true;
+}
+
+//------------------------------------------------------------------------------
+void Uart_RX_put_buf(uart_t *uart, uint8_t *data, int16_t len) {
+  while (--len >= 0) {
+    Uart_RX_put_char(uart, *data++);
+    }
+}
+
+//------------------------------------------------------------------------------
+int16_t Radio_RX_test_state = -1;
+void Radio_RX_test(void) {
+  switch (Radio_RX_test_state) {
+    case  0: // ?SN?\r
+             Uart_RX_put_buf(&Radio_Uart2, (uint8_t *) Radio_RX_init_string, sizeof(Radio_RX_init_string) - 1);
+             Radio_RX_test_state++;
+             break;
+
+    case  2: // RGB indicator control message (all on green)
+             Uart_RX_put_buf(&Radio_Uart2, (uint8_t *) rx_msg1, sizeof(rx_msg1));
+             Radio_RX_test_state++;
+             break;
+
+    case  4: // general machine status request
+             Uart_RX_put_buf(&Radio_Uart2, (uint8_t *) rx_msg2, sizeof(rx_msg2));
+             Radio_RX_test_state++;
+             break;
+
+    case  6: // RGB indicator control message (all off)
+             Radio_RX_test_state++;
+             Uart_RX_put_buf(&Radio_Uart2, (uint8_t *) rx_msg3, sizeof(rx_msg3));
+    }
+}
+#endif
